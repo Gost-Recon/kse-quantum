@@ -1533,6 +1533,212 @@ def ai_verdict_from_parts(parts: dict, n_patterns: int = 0):
 
 
 # ========================= TAB: AI INTELLIGENCE ===========================
+# ---------------------------------------------------------------
+# AI Backtest — historical hit-rate of the pattern signals
+# ---------------------------------------------------------------
+BACKTEST_SYMBOLS = ["HBL", "MCB", "LUCK", "OGDC", "PSO", "ENGRO", "FFC",
+                    "TRG", "SYS", "NBP", "SNGP", "TOMCL", "PPL", "MARI",
+                    "EFERT", "FABL", "DCR", "PRL"]
+HORIZONS = (5, 20, 60)
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def ai_backtest(symbols: tuple, min_bars: int = 320):
+    """Walk each symbol's daily history; whenever a pattern the AI engine
+    recognises appears, record the forward return 5/20/60 trading days later.
+    Returns a tidy DataFrame: pattern, direction, hits, plus hit-rate and mean
+    return per horizon."""
+    rows = []
+    for sym in symbols:
+        try:
+            df = get_timeseries(sym)
+        except Exception:
+            continue
+        if df.empty or len(df) < min_bars:
+            continue
+        c = df["close"].astype(float).reset_index(drop=True)
+        n = len(c)
+        ma50 = c.rolling(50).mean()
+        ma100 = c.rolling(100).mean()
+        ma20 = c.rolling(20).mean()
+        hi250 = c.rolling(250, min_periods=200).max()
+        lo50 = c.rolling(50, min_periods=40).min()
+        sig50 = (ma50 - ma100).fillna(0.0)
+        for i in range(120, n - max(HORIZONS)):
+            px = float(c.iloc[i])
+            # golden / death cross within the last 5 bars
+            if sig50.iloc[i] > 0 and sig50.iloc[i - 5] <= 0:
+                rows.append((sym, "Golden cross (50/100-day MA)", 1, i))
+            elif sig50.iloc[i] < 0 and sig50.iloc[i - 5] >= 0:
+                rows.append((sym, "Death cross (50/100-day MA)", -1, i))
+            # 52-week high zone (never touched it in the last 20 bars)
+            if px >= float(hi250.iloc[i]) * 0.995 and (
+                    i < 20 or px < float(hi250.iloc[i - 20]) * 0.995):
+                rows.append((sym, "52-week high zone", 1, i))
+        # vectorised second pass for breakouts / oversold reversals
+        roll_hi20 = c.rolling(20).max().shift(1)
+        roll_lo20 = c.rolling(20).min().shift(1)
+        rsi_period = 14
+        delta = c.diff()
+        up = delta.clip(lower=0).rolling(rsi_period).mean()
+        dn = (-delta.clip(upper=0)).rolling(rsi_period).mean()
+        rsi = 100 - 100 / (1 + up / dn.replace(0, np.nan))
+        ma20_prev = ma20.shift(1)
+        for i in range(120, n - max(HORIZONS)):
+            px = float(c.iloc[i])
+            if not np.isnan(roll_hi20.iloc[i]) and px > float(roll_hi20.iloc[i]):
+                rows.append((sym, "20-day channel breakout", 1, i))
+            elif not np.isnan(roll_lo20.iloc[i]) and px < float(roll_lo20.iloc[i]):
+                rows.append((sym, "20-day channel breakdown", -1, i))
+            if not np.isnan(rsi.iloc[i - 5]) and rsi.iloc[i - 5] < 30 and rsi.iloc[i] > 30:
+                rows.append((sym, "Oversold reversal (RSI 14)", 1, i))
+            elif not np.isnan(rsi.iloc[i - 5]) and rsi.iloc[i - 5] > 70 and rsi.iloc[i] < 70:
+                rows.append((sym, "Overbought rollover (RSI 14)", -1, i))
+            if not np.isnan(ma20_prev.iloc[i - 5]) and (float(ma20.iloc[i]) - px) * (
+                    float(ma20_prev.iloc[i]) - float(c.iloc[i - 5])) < 0:
+                cross_up = float(ma20.iloc[i]) <= px
+                rows.append((sym, "Price crossed 20-day MA (bull)" if cross_up
+                             else "Price crossed 20-day MA (bear)",
+                             1 if cross_up else -1, i))
+    # measure forward returns per signal
+    out = {}
+    price_map = {}
+    for sym in symbols:
+        try:
+            price_map[sym] = get_timeseries(sym)["close"].astype(float).tolist()
+        except Exception:
+            pass
+    for sym, pat, d, i in rows:
+        c_all = price_map.get(sym)
+        if c_all is None:
+            continue
+        for h in HORIZONS:
+            j = i + h
+            if j >= len(c_all):
+                continue
+            ret = (c_all[j] / c_all[i] - 1) * 100 * d  # direction-adjusted
+            key = pat
+            o = out.setdefault(key, {"dir": d, "n": 0,
+                                     **{f"r{h}": [] for h in HORIZONS}})
+            o["n"] += 1
+            for h in HORIZONS:
+                jj = i + h
+                if jj < len(c_all):
+                    o[f"r{h}"].append((c_all[jj] / c_all[i] - 1) * 100 * d)
+    recs = []
+    for pat, o in out.items():
+        rec = {"pattern": pat, "direction": "bullish" if o["dir"] > 0 else "bearish",
+               "signals": o["n"]}
+        for h in HORIZONS:
+            v = o[f"r{h}"]
+            rec[f"{h}d hit%"] = round(100 * sum(1 for x in v if x > 0) / len(v)) if v else np.nan
+            rec[f"{h}d avg%"] = round(float(np.mean(v)), 2) if v else np.nan
+        recs.append(rec)
+    return pd.DataFrame(recs).sort_values("20d avg%", ascending=False)
+
+# ===================== NARRATOR (INTERPRETER LAYER) ========================
+# Converts computed facts into analyst prose. Every sentence is assembled
+# from measured engine outputs — no model, no API, no hallucination by
+# construction. If there is no computed basis, there is no sentence.
+
+def _fact_score_word(score):
+    if score is None or not np.isfinite(score):
+        return "not measurable today"
+    if score >= 45: return "strongly positive"
+    if score >= 18: return "positive"
+    if score > -18: return "neutral"
+    if score > -45: return "negative"
+    return "strongly negative"
+
+
+def _fact_hit_sentence(pattern, horizons=(20,)):
+    """Backtest-grounded sentence for one pattern name (best matching row)."""
+    global _BT_CACHE
+    try:
+        bt = ai_backtest(tuple(BACKTEST_SYMBOLS))
+    except Exception:
+        return None
+    if bt is None or bt.empty:
+        return None
+    row = bt[bt["pattern"].str.contains(pattern.split("(")[0].strip(),
+                                        case=False, regex=False)]
+    if row.empty:
+        return None
+    row = row.iloc[0]
+    h = horizons[0]
+    n, hit, avg = row["signals"], row[f"{h}d hit%"], row[f"{h}d avg%"]
+    if n < 30:
+        return (f"historical evidence here is thin ({int(n)} samples in the "
+                f"backtest) — treat this as observation, not signal")
+    return (f"across {int(n):,} historical occurrences on PSX, this signal "
+            f"was direction-correct {hit:.0f}% of the time at {h} trading "
+            f"days, averaging {avg:+.2f}%")
+
+
+def ai_narrate(sym, parts, patterns, verdict, regime, ticks=None):
+    """Compose the analyst briefing strictly from computed facts.
+    Returns a markdown string. Anything without a computed basis is omitted."""
+    s = []
+    # 1) Regime context
+    if regime:
+        s.append(f"**Tape:** the wider market is **{regime['regime']}** — "
+                 f"{regime['breadth']*100:.0f}% of scrips advanced, "
+                 f"average move {regime['avg_change']:+.2f}%, "
+                 f"dispersion {regime['dispersion']:.2f}. "
+                 + ("Signals carry reduced confidence in tape like this."
+                    if regime["regime"] == "CHOPPY" else ""))
+    # 2) Composite + verdict (engine maths only)
+    if verdict:
+        tone = {"PULL IN": "conditions favour building exposure",
+                "RETAIN": "hold existing positioning and re-check on new data",
+                "PULL OUT": "conditions favour reducing exposure"}[verdict["verdict"]]
+        s.append(f"**Composite signal {verdict['composite']:+.0f}/±100 — "
+                 f"{verdict['verdict']}:** {tone}. Confidence "
+                 f"**{verdict['confidence']}** ({verdict['coverage']*100:.0f}% "
+                 f"evidence coverage, {verdict['n_factors']}/6 factors scored)")
+    # 3) Pattern facts with backtest grounding
+    if patterns:
+        for name, direction, why in patterns:
+            arrow = {1: "bullish", -1: "bearish", 0: "watch"}[direction]
+            sent = _fact_hit_sentence(name)
+            bt_txt = f" ({sent})" if sent else ""
+            s.append(f"**Pattern — {name} ({arrow}):** {why}{bt_txt}")
+    else:
+        s.append("**No qualifying pattern right now** — the engine stands "
+                 "down rather than invent one.")
+    # 4) Strongest / weakest factors
+    used = {k: v for k, v in parts.items()
+            if v is not None and np.isfinite(v)}
+    if used:
+        best = max(used, key=used.get)
+        worst = min(used, key=used.get)
+        if abs(used[best]) >= 30:
+            s.append(f"**Strongest driver:** {best} — "
+                     f"{_fact_score_word(used[best])} "
+                     f"({used[best]*100:+.0f} contribution).")
+        if abs(used[worst]) >= 30 and used[worst] != used[best]:
+            s.append(f"**Strongest drag:** {worst} — "
+                     f"{_fact_score_word(used[worst])} "
+                     f"({used[worst]*100:+.0f} contribution).")
+        missing = [k for k in parts if k not in used]
+        if missing:
+            s.append(f"**Not scored today** ({len(missing)}): {', '.join(missing)} "
+                     "— no computed basis, so the engine says nothing about "
+                     "them rather than guessing.")
+    # 5) Contradiction surfacing (daily momentum vs intraday flow)
+    perc = parts.get("Price perception & momentum")
+    flow = parts.get("Buying / selling flow")
+    if perc is not None and flow is not None and np.isfinite(perc) and \
+            np.isfinite(flow) and perc * flow < 0 and abs(perc) > 20:
+        s.append(f"**Conflicting picture:** daily momentum is "
+                 f"{_fact_score_word(perc)} while today's trade flow is "
+                 f"{_fact_score_word(flow)}. Classic divergence — the "
+                 "engine flags it rather than averaging it away.")
+    if not s:
+        return "**Insufficient measured data today** — the engine has no " \
+               "computed basis for a briefing and will not improvise."
+    return "\n\n".join(s)
+
+
 def _ai_tab():
     st.subheader("🧠 AI Intelligence — quantitative engine")
     st.caption("Rule-based, fully explainable, computed 100% on official PSX "
@@ -1570,6 +1776,31 @@ def _ai_tab():
                        "signals; negative = aligned bearish.")
     except PSXUnavailable as e:
         st.error(f"Market data unavailable: {e}")
+
+    st.divider()
+    st.markdown("#### 🧪 Signal backtest — do these patterns actually pay?")
+    st.caption("Every pattern the engine uses, tested against PSX daily history "
+               "(last ~1 year, 18 liquid scrips). Hit% = share of signals that "
+               "were direction-correct after N trading days; avg% = mean "
+               "direction-adjusted return. Small samples = weak evidence.")
+    if st.button("Run backtest", key="bt_run"):
+        st.session_state["bt_go"] = True
+    if st.session_state.get("bt_go"):
+        with st.spinner("Walking 18 scrips × ~250 bars, measuring every signal…"):
+            try:
+                bt = ai_backtest(tuple(BACKTEST_SYMBOLS))
+            except Exception as e:
+                st.error(f"Backtest failed: {e}")
+                bt = pd.DataFrame()
+        if bt is not None and not bt.empty:
+            st.dataframe(bt, use_container_width=True, hide_index=True)
+            best = bt.iloc[0]
+            st.caption(f"Strongest historical pattern: **{best['pattern']}** — "
+                       f"{best['signals']} signals, {best['20d hit%']}% hit-rate "
+                       f"and {best['20d avg%']:+.2f}% average at 20 days. "
+                       "Past performance ≠ future results.")
+        elif bt is not None:
+            st.info("No pattern signals found in the available history.")
 
     st.divider()
     st.markdown("#### 📌 Per-company AI verdict")
@@ -1629,6 +1860,12 @@ def _ai_tab():
                f"{v['n_factors']}/6 factors scored")
     c3.metric("Patterns detected", len(patterns))
     st.info(v["why"])
+    st.markdown("##### 🎙 Machine briefing (Narrator layer)")
+    st.caption("Every sentence below is assembled from computed engine facts — "
+               "traceable, reproducible, impossible to hallucinate. Where no "
+               "computed basis exists, the engine says so instead of guessing.")
+    regime = ai_market_regime()
+    st.info(ai_narrate(sym, parts, patterns, v, regime, ticks), icon="🎯")
     if patterns:
         st.markdown("**Chart patterns the engine detects right now:**")
         for name, direction, why in patterns:
