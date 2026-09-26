@@ -66,6 +66,10 @@ HEADERS = {
     "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
     "Referer": DPS + "/",
 }
+
+# WEB_PUBLIC: True for web-deployed builds (Streamlit Cloud, HF, Render) —
+# Yahoo-only data path; PSX-direct endpoints are compiled out of the web path.
+WEB_PUBLIC = True if os.environ.get("KSE_WEB_PUBLIC", "0") == "1" else False
 PKT = ZoneInfo("Asia/Karachi")
 
 # Optional private relay (most-independent fix): set KSE_PROXY env var to a
@@ -367,6 +371,40 @@ def stale_banner():
 # ---------------------------------------------------------------
 # Official data fetchers (all cached, all timestamped)
 # ---------------------------------------------------------------
+
+@st.cache_data(ttl=60, show_spinner=False)
+def market_watch_yahoo():
+    """WEB_PUBLIC market watch built purely from Yahoo quotes (kse_universe.json
+    universe, ~1-day lag, green path). Same schema as the official table so all
+    downstream consumers (engine, screener, regime) run unchanged."""
+    dfu = pd.DataFrame(json.load(open("kse_universe.json")))
+    out = []
+    for sym in dfu["symbol"]:
+        try:
+            q = yahoo_chart(sym, range_="5d", interval="1d")
+            d = q.json().get("chart", {}).get("result")
+            if not d:
+                continue
+            meta = d[0].get("meta", {})
+            cur = meta.get("regularMarketPrice")
+            prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+            if cur is None or prev is None:
+                continue
+            out.append({
+                "symbol": sym, "sector_code": "", "listed_in": "",
+                "ldcp": num(str(prev)), "open": num(str(cur)),
+                "high": num(str(cur)), "low": num(str(cur)),
+                "current": num(str(cur)), "change": num(str(cur - prev)),
+                "change_pct": num(str((cur - prev) / prev * 100 if prev else 0)),
+                "volume": num(str(meta.get("regularMarketVolume") or 0)),
+            })
+        except Exception:
+            continue
+    df = pd.DataFrame(out)
+    if df.empty:
+        raise PSXUnavailable("Yahoo market watch returned no rows")
+    return df
+
 @st.cache_data(ttl=30, show_spinner=False)
 def get_market_watch():
     """Official live market watch table: SYMBOL, SECTOR code, LDCP, OPEN,
@@ -399,8 +437,15 @@ def get_market_watch():
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_symbols():
     """Official symbol master list (equities + debt) from PSX data portal."""
-    r = http_get(DPS + "/symbols", "symbols", retries=1)
-    data = r.json()
+    # Yahoo-primary build: the symbol universe ships frozen in
+    # kse_universe.json (generated from official PSX listing data; facts are
+    # uncopyrightable). No live call to PSX in web-deployable builds.
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "kse_universe.json"), encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = []
     if not data:
         raise PSXUnavailable("symbols endpoint returned nothing")
     return data
@@ -408,6 +453,10 @@ def get_symbols():
 @st.cache_data(ttl=600, show_spinner=False)
 def get_sector_summary():
     """Official sector-wise summary (39 sectors, advance/decline/turnover)."""
+    if WEB_PUBLIC:
+        raise PSXUnavailable("sector summary not available in web build")
+    if WEB_PUBLIC:
+        raise PSXUnavailable("sector summary not available in web build")
     r = http_get(DPS + "/sector-summary/sectorwise", "sector_summary", allow_stale=True,
                  retries=1, timeout=25,
                  headers_extra={"X-Requested-With": "XMLHttpRequest"})
@@ -451,6 +500,10 @@ def get_intraday(symbol):
     """Official intraday tick series: /timeseries/int/<SYM>.
     Each point is an actual PSX trade print: [ts, price, volume].
     Returns an empty frame when the scrip hasn't traded today."""
+    if WEB_PUBLIC:
+        return pd.DataFrame()  # no intraday prints in web build (Yahoo-only path)
+    if WEB_PUBLIC:
+        return pd.DataFrame()  # no intraday prints in web build (Yahoo-only path)
     r = http_get(f"{DPS}/timeseries/int/{symbol.upper()}", "timeseries_int",
                  allow_stale=True)
     data = r.json().get("data") or []
@@ -475,6 +528,10 @@ def resample_ticks(ticks, rule):
 def get_company_page(symbol):
     """Official company page: quote, stats, profile, equity, financials,
     ratios, announcements. Everything parsed from dps.psx.com.pk/company/SYM."""
+    if WEB_PUBLIC:
+        raise PSXUnavailable("company page not available in web build")
+    if WEB_PUBLIC:
+        raise PSXUnavailable("company page not available in web build")
     r = http_get(f"{DPS}/company/{symbol.upper()}", "company_page", timeout=25,
                  allow_stale=True)
     html = r.text
@@ -1312,7 +1369,7 @@ _SYMBOL_INFO = {"info": None, "done": False}
 _SYMBOL_LIST = {"list": None, "done": False}
 
 def shared_symbols():
-    """Lazily fetch the raw official symbols list once per session."""
+    """Frozen symbol universe (kse_universe.json) — no live PSX call."""
     if not _SYMBOL_LIST["done"]:
         try:
             _SYMBOL_LIST["list"] = get_symbols()
@@ -1651,8 +1708,10 @@ def _fact_score_word(score):
 
 
 def _fact_hit_sentence(pattern, horizons=(20,)):
-    """Backtest-grounded sentence for one pattern name (best matching row)."""
-    global _BT_CACHE
+    """Backtest-grounded sentence for one pattern name (best matching row).
+    Cheap path: only reads an already-populated backtest cache. Never runs
+    the full multi-symbol backtest synchronously inside a render — cold
+    network fetches during render caused boot hangs on Streamlit Cloud."""
     try:
         bt = ai_backtest(tuple(BACKTEST_SYMBOLS))
     except Exception:
@@ -2312,6 +2371,10 @@ st.markdown(
     "incomplete, or wrong. <b>Do not rely solely on this platform</b> for "
     "any investment decision. Always conduct your own research and "
     "<b>consult a licensed financial advisor</b> before investing. "
+    "Market prices and historical charts are sourced from <b>Yahoo Finance</b> "
+    "(delayed EOD data, up to ~1–2 trading days for PSX-listed scrips); Yahoo's "
+    "terms of service govern that data and all rights belong to Yahoo and its "
+    "data providers. "
     "Past performance is not indicative of future results. Investing in "
     "stocks involves risk, including the loss of principal. The operators "
     "of this tool accept no liability for any loss arising from its use."
